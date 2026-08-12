@@ -30,6 +30,10 @@
 // Statement about whether the library was built/installed as static or shared.
 #cmakedefine DJINTEROP_STATIC
 
+// Defined when the optional Rekordcrate adapter was compiled in. Its symbols
+// pull in the rekordcrate Rust crate via a cxx bridge; absent otherwise.
+#cmakedefine DJINTEROP_REKORDCRATE
+
 #if defined _WIN32 || defined __CYGWIN__
 #if defined DJINTEROP_STATIC
 #define DJINTEROP_SYMBOL_IMPORT

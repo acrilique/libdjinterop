@@ -49,6 +49,11 @@ option(SYSTEM_DATE_H "Use system installation of date.h" OFF)
 option(SYSTEM_SQLITE "Use system installation of SQLite" ON)
 option(SYSTEM_SQLITE_MODERN_CPP "Use system installation of sqlite_modern_cpp" OFF)
 
+# The Rekordbox export adapter (via rekordcrate) pulls in the `rekordcrate` Rust crate over a
+# cxx bridge. It requires a Rust toolchain and is therefore opt-in; the default
+# build stays C++-only with no Cargo dependency.
+option(BUILD_REKORDCRATE "Build the Rekordbox adapter (requires Rust/Cargo)" OFF)
+
 add_library(
     DjInterop
     include/djinterop/album_art.hpp
@@ -211,6 +216,13 @@ add_library(
     src/djinterop/util/random.cpp
     src/djinterop/util/random.hpp
     src/djinterop/util/sqlite_transaction.hpp
+    # ---- rekordbox write-only adapter (opt-in via BUILD_REKORDCRATE) ----
+    # The rekordbox sources are added conditionally below via target_sources,
+    # after the Corrosion target they link against is set up. Only
+    # `rekordcrate_writer.cpp` touches the cxx bridge; the other files depend
+    # solely on `rekordcrate_writer.hpp` (a plain-C++ pimpl), so the adapter is
+    # isolated from the rest of the library and excluded from the default build
+    # to avoid a hard Cargo dependency.
 )
 
 set_target_properties(DjInterop PROPERTIES
@@ -222,7 +234,13 @@ target_compile_definitions(DjInterop PUBLIC DJINTEROP_SOURCE)
 
 get_target_property(DJINTEROP_LIBRARY_TYPE DjInterop TYPE)
 if(DJINTEROP_LIBRARY_TYPE STREQUAL "STATIC_LIBRARY")
-	set(DJINTEROP_STATIC ON)
+    set(DJINTEROP_STATIC ON)
+endif()
+
+# Propagate the rekordbox option to config.hpp so the aggregate header can
+# gate the (optional) rekordbox include without a hard dependency on it.
+if(BUILD_REKORDCRATE)
+    set(DJINTEROP_REKORDCRATE ON)
 endif()
 
 # Generate config.hpp based on build-time environment.
@@ -305,11 +323,117 @@ endif()
 set_target_properties(DjInterop PROPERTIES C_VISIBILITY_PRESET hidden)
 set_target_properties(DjInterop PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
-install(TARGETS DjInterop
-        EXPORT DjInteropTargets
-        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+# ---- rekordbox adapter: build rekordcrate via Corrosion, fold it in privately ----
+if(BUILD_REKORDCRATE)
+    # Corrosion drives Cargo from CMake and propagates the Rust link deps.
+    include(FetchContent)
+    FetchContent_Declare(
+        corrosion
+        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+        GIT_TAG v0.6.1
+    )
+    FetchContent_MakeAvailable(corrosion)
+
+    # Rust toolchain is mandatory for this adapter.
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+
+    # `../` is the rekordcrate crate root (libdjinterop is nested inside it).
+    # CRATE_TYPES staticlib: the crate also ships a same-named `[[bin]]`
+    # (cli), which collides with the lib target name and makes Corrosion warn
+    # + skip. We only need the static lib for the cxx bridge, so restrict to it.
+    corrosion_import_crate(
+            MANIFEST_PATH ../Cargo.toml
+            CRATES rekordcrate
+            CRATE_TYPES staticlib)
+
+    # Only the `cpp` feature is needed: the writer uses no artwork/analysis
+    # fields, and ANLZ expansion compiles under `any(analysis, cpp)`. Disabling
+    # the default features avoids pulling in cli/xml and their deps.
+    corrosion_set_features(rekordcrate NO_DEFAULT_FEATURES FEATURES cpp)
+
+    # Generate the cxx headers/sources (`rust/cxx.h` + `rekordcrate-cpp/cpp.h`)
+    # and build a `rekordcrate-cpp` static lib target from the generated C++.
+    corrosion_add_cxxbridge(rekordcrate-cpp CRATE rekordcrate FILES cpp.rs)
+
+    # The cxx-generated sources trigger `-Wmaybe-uninitialized` false positives
+    # that the project-wide `-Werror` (above) would promote to errors. This is
+    # generated code we don't own, so relax `-Werror` for it alone.
+    if(NOT MSVC)
+        target_compile_options(rekordcrate-cpp PRIVATE -Wno-error)
+    endif()
+
+    # The adapter is folded into the shared libdjinterop, so the generated C++
+    # static lib must be position-independent; Corrosion leaves PIC off by default.
+    set_target_properties(rekordcrate-cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    # The full rekordbox adapter is only added now that the cxx target exists.
+    target_sources(DjInterop PRIVATE
+        src/djinterop/rekordcrate/crate_impl.cpp
+        src/djinterop/rekordcrate/crate_impl.hpp
+        src/djinterop/rekordcrate/database_impl.cpp
+        src/djinterop/rekordcrate/database_impl.hpp
+        src/djinterop/rekordcrate/playlist_impl.cpp
+        src/djinterop/rekordcrate/playlist_impl.hpp
+        src/djinterop/rekordcrate/rekordcrate.cpp
+        src/djinterop/rekordcrate/rekordcrate_writer.cpp
+        src/djinterop/rekordcrate/rekordcrate_writer.hpp
+        src/djinterop/rekordcrate/snapshot.cpp
+        src/djinterop/rekordcrate/snapshot.hpp
+        src/djinterop/rekordcrate/track_impl.cpp
+        src/djinterop/rekordcrate/track_impl.hpp)
+
+    # Private link: the Rust static lib is folded into libdjinterop and never
+    # advertised to downstream consumers (cf. vendored SQLite in djinterop.pc).
+    target_link_libraries(DjInterop PRIVATE rekordcrate-cpp)
+
+    # When libdjinterop is built static, a PRIVATE link does not carry the
+    # cxx-bridge + Rust objects across the archive boundary — downstream
+    # consumers (e.g. Mixxx) link `libdjinterop.a` directly and hit undefined
+    # `rust::cxxbridge1::*` / `rekordcrate::writer_*` symbols. Fold both dep
+    # archives into the libdjinterop archive with an `ar -M` MRI script so the
+    # installed `.a` is self-contained. (A shared lib inlines its PRIVATE deps,
+    # so this is only needed for the static build.)
+    get_target_property(DJINTEROP_LIB_TYPE DjInterop TYPE)
+    if(DJINTEROP_LIB_TYPE STREQUAL "STATIC_LIBRARY")
+        set(RUST_STATIC_LIB "${CMAKE_CURRENT_BINARY_DIR}/librekordcrate.a")
+        set(MERGE_MRI "${CMAKE_CURRENT_BINARY_DIR}/fold-rekordcrate.mri")
+        file(GENERATE OUTPUT "${MERGE_MRI}" CONTENT
+"CREATE $<TARGET_FILE:DjInterop>
+ADDLIB $<TARGET_FILE:DjInterop>
+ADDLIB $<TARGET_FILE:rekordcrate-cpp>
+ADDLIB ${RUST_STATIC_LIB}
+SAVE
+END
+")
+        find_program(CMAKE_AR_EXECUTABLE ar REQUIRED)
+        add_custom_command(TARGET DjInterop POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E cmake_echo_color
+                        --cyan --bold
+                        "Folding rekordcrate-cpp + librekordcrate.a into $<TARGET_FILE:DjInterop>"
+                COMMAND ${CMAKE_AR_EXECUTABLE} -M < "${MERGE_MRI}"
+                BYPRODUCTS "${RUST_STATIC_LIB}"
+                COMMENT "Folding rekordcrate objects into libdjinterop.a"
+                VERBATIM)
+    endif()
+endif()
+
+# When the rekordcrate adapter is folded in, DjInterop links the privately-built
+# `rekordcrate-cpp` static lib, which cannot belong to any export set. The
+# adapter build is a vendored (non-redistributable) build that downstream
+# consumers link directly as a static lib — they don't consume a CMake package —
+# so we skip the EXPORT here and the package-config install below.
+if(BUILD_REKORDCRATE)
+    install(TARGETS DjInterop
+            ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+else()
+    install(TARGETS DjInterop
+            EXPORT DjInteropTargets
+            ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+            RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/include/djinterop/config.hpp
@@ -357,9 +481,14 @@ install(FILES
     include/djinterop/engine/v3/track_data_blob.hpp
     include/djinterop/engine/v3/track_table.hpp
     DESTINATION "${DJINTEROP_INSTALL_INCLUDEDIR}/engine/v3")
+if(BUILD_REKORDCRATE)
+    install(FILES
+        include/djinterop/rekordcrate/rekordcrate.hpp
+        DESTINATION "${DJINTEROP_INSTALL_INCLUDEDIR}/rekordcrate")
+endif()
 
 
-if (UNIX)
+if (UNIX AND NOT BUILD_REKORDCRATE)
     set(PKGCONFIG_TARGET djinterop)
     if (SYSTEM_SQLITE)
         set(PKGCONFIG_REQUIRES "zlib >= ${ZLIB_MIN_VERSION}, sqlite3 >= ${SQLITE_MIN_VERSION}")
@@ -373,24 +502,29 @@ if (UNIX)
 endif()
 
 # CMake package config export.
-include(CMakePackageConfigHelpers)
-set(DJINTEROP_INSTALL_CMAKEDIR "lib/cmake/DjInterop")
-install(EXPORT DjInteropTargets
-        FILE DjInteropTargets.cmake
-        NAMESPACE DjInterop::
-        DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
-configure_package_config_file(
-        DjInteropConfig.cmake.in
-        "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfig.cmake"
-        INSTALL_DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
-write_basic_package_version_file(
-        "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfigVersion.cmake"
-        VERSION "${CMAKE_PROJECT_VERSION}"
-        COMPATIBILITY SameMajorVersion)
-install(FILES
-        "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfig.cmake"
-        "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfigVersion.cmake"
-        DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
+# Skipped for the adapter build: the exported `DjInterop` target links the
+# privately-built `rekordcrate-cpp`, which can't be part of an export set, so
+# there is no `DjInteropTargets.cmake` to ship (see the install(TARGETS) guard).
+if(NOT BUILD_REKORDCRATE)
+    include(CMakePackageConfigHelpers)
+    set(DJINTEROP_INSTALL_CMAKEDIR "lib/cmake/DjInterop")
+    install(EXPORT DjInteropTargets
+            FILE DjInteropTargets.cmake
+            NAMESPACE DjInterop::
+            DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
+    configure_package_config_file(
+            DjInteropConfig.cmake.in
+            "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfig.cmake"
+            INSTALL_DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
+    write_basic_package_version_file(
+            "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfigVersion.cmake"
+            VERSION "${CMAKE_PROJECT_VERSION}"
+            COMPATIBILITY SameMajorVersion)
+    install(FILES
+            "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfig.cmake"
+            "${CMAKE_CURRENT_BINARY_DIR}/DjInteropConfigVersion.cmake"
+            DESTINATION "${DJINTEROP_INSTALL_CMAKEDIR}")
+endif()
 
 # Build example programs by default.
 option(BUILD_EXAMPLES "Build example programs" ON)
@@ -407,6 +541,11 @@ if (BUILD_EXAMPLES)
 
     add_djinterop_example(engine_prime)
     add_djinterop_example(engine_library_v2_low_level)
+    # The rekordbox example links the rekordcrate cxx static lib via
+    # rekordcrate_writer.cpp; only buildable when the adapter is enabled.
+    if(BUILD_REKORDCRATE)
+        add_djinterop_example(rekordcrate)
+    endif()
 endif()
 
 # Unit tests.

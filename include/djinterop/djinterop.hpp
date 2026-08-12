@@ -30,6 +30,9 @@
 #include <djinterop/pad_color.hpp>
 #include <djinterop/performance_data.hpp>
 #include <djinterop/playlist.hpp>
+#ifdef DJINTEROP_REKORDCRATE
+#include <djinterop/rekordcrate/rekordcrate.hpp>
+#endif
 #include <djinterop/semantic_version.hpp>
 #include <djinterop/track.hpp>
 #include <djinterop/track_snapshot.hpp>
