@@ -337,12 +337,23 @@ if(BUILD_REKORDCRATE)
     # Rust toolchain is mandatory for this adapter.
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
-    # `../` is the rekordcrate crate root (libdjinterop is nested inside it).
+    # Fetch the rekordcrate crate from git. Point at a local checkout with
+    # -DFETCHCONTENT_SOURCE_DIR_REKORDCRATE=<dir>, or pin a reproducible ref
+    # with -DREKORDCRATE_GIT_TAG=<sha>.
+    set(REKORDCRATE_GIT_URL "https://github.com/acrilique/rekordcrate.git"
+        CACHE STRING "rekordcrate git URL")
+    set(REKORDCRATE_GIT_TAG "feat/cxx-ffi"
+        CACHE STRING "rekordcrate git ref")
+    FetchContent_Declare(rekordcrate
+        GIT_REPOSITORY ${REKORDCRATE_GIT_URL}
+        GIT_TAG ${REKORDCRATE_GIT_TAG})
+    FetchContent_MakeAvailable(rekordcrate)
+
     # CRATE_TYPES staticlib: the crate also ships a same-named `[[bin]]`
     # (cli), which collides with the lib target name and makes Corrosion warn
     # + skip. We only need the static lib for the cxx bridge, so restrict to it.
     corrosion_import_crate(
-            MANIFEST_PATH ../Cargo.toml
+            MANIFEST_PATH ${rekordcrate_SOURCE_DIR}/Cargo.toml
             CRATES rekordcrate
             CRATE_TYPES staticlib)
 
